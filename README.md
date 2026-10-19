@@ -1,8 +1,10 @@
 # MaximizeToVirtualDesktop
 
-Bring macOS's green-button "maximize to full-screen virtual desktop" behavior to Windows 11.
+Automatically give maximized application windows their own Windows virtual desktop, with `Ctrl+[` / `Ctrl+]` navigation.
 
-When triggered, the foreground window is moved to a brand-new virtual desktop and maximized. Closing, un-maximizing, or toggling the hotkey again restores everything — the window returns to its original desktop and size, and the temporary desktop is removed.
+This fork adds Windows 10 22H2 support and automatic window management to [shanselman/MaximizeToVirtualDesktop](https://github.com/shanselman/MaximizeToVirtualDesktop). See [中文开发与使用说明](docs/DEVELOPMENT.zh-CN.md) for build commands, test evidence, and limitations.
+
+Newly maximized windows move to a new desktop automatically. Restoring or minimizing returns the window to its original desktop, preserving minimization. Closing a background window does not change the current desktop. Temporary desktops containing other application windows are retained.
 
 ![MaximizeToVirtualDesktop demo](img/maximizetovd_compressed.gif)
 
@@ -10,27 +12,30 @@ When triggered, the foreground window is moved to a brand-new virtual desktop an
 
 | Trigger | How |
 |---------|-----|
+| **Maximize** | Automatically enter a dedicated desktop; hold `Shift` to bypass |
+| **Ctrl + [ / Ctrl + ]** | Previous / next desktop; stops at the edge |
 | **Hotkey** | `Ctrl + Alt + Shift + X` — toggles the foreground window |
-| **Shift + Click** | Hold `Shift` and click a window's maximize button |
+| **Manual mode** | Turn automatic mode off in Settings to use the original Shift+Click behavior |
 
 The app runs in the system tray. Right-click the tray icon for options:
 - **Restore All** — brings all windows back and removes temp desktops
 - **How to Use** — shows usage instructions
-- **Settings** — configure hotkeys and whether switch popups are shown
+- **Settings** — automatic mode, navigation, excluded apps, existing windows, and popups
 - **Check for Updates** — checks for new releases on GitHub
 - **Exit** — restores all windows, then exits
 
 ## How It Works
 
-1. **Maximize** — creates a new virtual desktop, moves the window there, switches to it, and maximizes the window. The desktop is named `[MVD] ProcessName` so you can identify it in Task View.
+1. **Maximize** — creates a new virtual desktop, moves the window there, and switches to it. Windows 11 desktops are named `[MVD] ProcessName`; Windows 10 uses system default names.
 2. **Auto-restore on un-maximize** — if you restore/un-maximize a tracked window, it's automatically sent back to its original desktop and the temp desktop is cleaned up.
 3. **Auto-restore on close** — closing a tracked window triggers the same cleanup.
 4. **Toggle** — pressing the hotkey on an already-tracked window restores it.
-5. **Crash recovery** — if the app is killed or crashes, orphaned desktops are automatically cleaned up on next launch.
+5. **Crash recovery** — empty recorded desktops are cleaned up on next launch; occupied desktops are preserved.
 
 ## Requirements
 
-- **Windows 11** (any version — 21H2 through 24H2+)
+- **Windows 10 22H2** (tested on x64 build 19045.6466)
+- **Windows 11** adapters are inherited from upstream and need validation on each target build
 - Self-contained — no .NET installation required
 
 The app auto-detects your Windows build and selects the correct COM vtable layout. If a future Windows update breaks things, the app enters degraded mode and checks for updates automatically.
@@ -47,18 +52,19 @@ Shift+Click works wherever Windows 11 Snap Layouts works — apps that correctly
 | Visual Studio | ✅ |
 | Apps with fully custom title bars | ❌ (use hotkey) |
 
-The hotkey **always** works, regardless of the window type.
+Automatic mode listens to window state changes rather than depending on the title-bar button. Administrator windows and custom applications still require compatibility testing.
 
 ## Building
 
 ```bash
-dotnet build
+./scripts/validate.ps1
+./scripts/validate.ps1 -Integration # interactive Windows session; test windows only
 ```
 
 ### Single-file publish
 
 ```bash
-dotnet publish -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
+./scripts/build.ps1
 ```
 
 ## Architecture
@@ -79,18 +85,20 @@ src/MaximizeToVirtualDesktop/
     └── DesktopManagerAdapter.cs Multi-version COM vtable adapter
 ```
 
-**Zero NuGet dependencies.** COM interop declarations are vendored from [MScholtes/VirtualDesktop](https://github.com/MScholtes/VirtualDesktop) (MIT license, actively maintained). The app ships two vtable layouts (pre-24H2 and 24H2+) and auto-selects the correct one with a smoke test fallback.
+COM interop declarations are adapted from [MScholtes/VirtualDesktop](https://github.com/MScholtes/VirtualDesktop) (MIT; see `THIRD-PARTY-NOTICES`). The app uses Updatum for updates from this fork. Version-specific adapters cover Windows 10 and the inherited Windows 11 layouts. Tests are under `tests/`.
 
 ## Design Principles
 
-1. **Reliable over featureful** — every code path handles failure. No crashes, no orphaned desktops, no stuck windows. If something goes wrong, roll back to the state before we touched anything.
-2. **Tight** — one project, zero packages, 9 files. Each file has one job.
-3. **Clean** — `IDisposable` on every native resource. No fire-and-forget. All WinEvent callbacks marshal to the UI thread.
+1. Keep desktop operations and automatic window policy separate.
+2. Make entering a desktop idempotent and preserve desktops containing other applications.
+3. Coalesce WinEvent callbacks and perform window mutations on the UI thread.
 
 ## Known Limitations
 
 - **Elevated windows** — cannot move windows running as Administrator from a non-elevated instance.
-- **App crash** — if the app crashes, temporary desktops are cleaned up automatically on next launch. They're prefixed with `[MVD]` in Task View for easy manual identification.
+- **App crash** — empty recorded temporary desktops are cleaned up on next launch. Occupied desktops remain available for manual recovery.
+- **Validation** — automated interactive tests pass on Windows 10 22H2. Windows 11, multiple monitors, elevated windows, Explorer restarts, and application-specific behavior require further testing.
+- **Shortcuts** — enabled global navigation takes over `Ctrl+[` and `Ctrl+]` from focused apps. Disable navigation in Settings to release them.
 
 ## The Virtual Desktop GUID Problem
 
