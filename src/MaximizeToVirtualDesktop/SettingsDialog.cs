@@ -18,6 +18,8 @@ internal sealed class SettingsDialog : Form
 
     private readonly CheckBox _chkInvertShiftClick;
     private readonly CheckBox _chkShowSwitchPopup;
+    private readonly CheckBox _chkAutoManage, _chkExisting, _chkNavigation;
+    private readonly TextBox _txtExcluded;
     private Button _btnStartup = null!;
 
     // (display name, VK code) pairs for the key combo boxes
@@ -64,7 +66,7 @@ internal sealed class SettingsDialog : Form
         y += grpPin.Height + 12;
 
         // Behavior group
-        var grpBehavior = new GroupBox { Text = "Behavior", Location = new Point(margin, y), Size = new Size(grpW, 124) };
+        var grpBehavior = new GroupBox { Text = "Behavior", Location = new Point(margin, y), Size = new Size(grpW, 252) };
         Controls.Add(grpBehavior);
         _chkShowSwitchPopup = new CheckBox
         {
@@ -83,6 +85,39 @@ internal sealed class SettingsDialog : Form
             Location = new Point(10, 54),
         };
         grpBehavior.Controls.Add(_chkInvertShiftClick);
+        _chkAutoManage = new CheckBox
+        {
+            Text = "Automatically give maximized windows their own desktop",
+            AutoSize = true, Checked = settings.AutoManageMaximizedWindows, Location = new Point(10, 84)
+        };
+        _chkExisting = new CheckBox
+        {
+            Text = "Include windows already maximized when the app starts",
+            AutoSize = true, Checked = settings.ManageExistingWindowsOnStart, Location = new Point(10, 114)
+        };
+        _chkNavigation = new CheckBox
+        {
+            Text = "Ctrl+[ / Ctrl+] switches to the previous / next desktop",
+            AutoSize = true, Checked = settings.EnableDesktopNavigation, Location = new Point(10, 144)
+        };
+        var excludedLabel = new Label
+        {
+            Text = "Excluded apps (comma-separated .exe names):",
+            AutoSize = true, Location = new Point(10, 177)
+        };
+        _txtExcluded = new TextBox
+        {
+            Text = string.Join(", ", settings.ExcludedProcesses ?? []),
+            Location = new Point(10, 200), Width = grpW - 24
+        };
+        grpBehavior.Controls.AddRange([_chkAutoManage, _chkExisting, _chkNavigation, excludedLabel, _txtExcluded]);
+        void UpdateBehaviorControls()
+        {
+            _chkInvertShiftClick.Enabled = !_chkAutoManage.Checked;
+            _chkExisting.Enabled = _chkAutoManage.Checked;
+        }
+        _chkAutoManage.CheckedChanged += (_, _) => UpdateBehaviorControls();
+        UpdateBehaviorControls();
         y += grpBehavior.Height + 12;
 
         // Manage Startup group
@@ -199,6 +234,10 @@ internal sealed class SettingsDialog : Form
 
         _chkShowSwitchPopup.Checked = true;
         _chkInvertShiftClick.Checked = false;
+        _chkAutoManage.Checked = true;
+        _chkExisting.Checked = false;
+        _chkNavigation.Checked = true;
+        _txtExcluded.Text = "";
     }
 
     private void ToggleStartup()
@@ -262,6 +301,10 @@ internal sealed class SettingsDialog : Form
         _settings.PinHotkeyKey       = _cmbPinKey.SelectedIndex >= 0 ? SupportedKeys[_cmbPinKey.SelectedIndex].Vk : NativeMethods.VK_P;
         _settings.ShowSwitchPopup    = _chkShowSwitchPopup.Checked;
         _settings.InvertShiftClick   = _chkInvertShiftClick.Checked;
+        _settings.AutoManageMaximizedWindows = _chkAutoManage.Checked;
+        _settings.ManageExistingWindowsOnStart = _chkExisting.Checked;
+        _settings.EnableDesktopNavigation = _chkNavigation.Checked;
+        _settings.ExcludedProcesses = _txtExcluded.Text.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
     }
 
     private static uint BuildModifiers(CheckBox ctrl, CheckBox alt, CheckBox shift, CheckBox win)

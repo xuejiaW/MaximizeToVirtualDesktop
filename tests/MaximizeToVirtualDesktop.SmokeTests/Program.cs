@@ -38,7 +38,60 @@ internal static class Program
         Require(desktops.GetDesktopCount() == before, "desktop count restored");
         Console.WriteLine("PASS: desktop interface smoke test");
         RunAutomaticLifecycle(desktops);
+        RunNavigation(desktops);
+        RenderSettings();
         return 0;
+    }
+
+    private static void RunNavigation(VirtualDesktopService desktops)
+    {
+        int before = desktops.GetDesktopCount();
+        Guid originalId = desktops.GetCurrentDesktopId()!.Value;
+        var (left, leftId) = desktops.CreateDesktop();
+        var (right, rightId) = desktops.CreateDesktop();
+        using var navigation = new DesktopNavigationHotkeys(goRight => desktops.SwitchAdjacentDesktop(goRight));
+        try
+        {
+            Require(left != null && right != null, "create navigation test desktops");
+            Require(navigation.Configure(true).Count == 0, "register Ctrl+[ and Ctrl+] globally");
+            desktops.SwitchToDesktop(left!);
+            NativeMethods.PostMessage(navigation.Handle, NativeMethods.WM_HOTKEY, (IntPtr)DesktopNavigationHotkeys.NextId, IntPtr.Zero);
+            WaitUntil(() => desktops.GetCurrentDesktopId() == rightId, "next hotkey message switches right");
+            NativeMethods.PostMessage(navigation.Handle, NativeMethods.WM_HOTKEY, (IntPtr)DesktopNavigationHotkeys.PreviousId, IntPtr.Zero);
+            WaitUntil(() => desktops.GetCurrentDesktopId() == leftId, "previous hotkey message switches left");
+            desktops.SwitchToDesktop(right!);
+            Require(!desktops.SwitchAdjacentDesktop(true) && desktops.GetCurrentDesktopId() == rightId,
+                "navigation stops at the last desktop");
+            navigation.Configure(false);
+            desktops.SwitchToDesktop(left!);
+            NativeMethods.PostMessage(navigation.Handle, NativeMethods.WM_HOTKEY, (IntPtr)DesktopNavigationHotkeys.NextId, IntPtr.Zero);
+            Pump(250);
+            Require(desktops.GetCurrentDesktopId() == leftId, "disabled navigation ignores queued hotkey messages");
+        }
+        finally
+        {
+            navigation.Dispose();
+            var original = desktops.FindDesktop(originalId);
+            try { if (original != null) desktops.SwitchToDesktop(original); }
+            finally { if (original != null) ComRelease.Release(original); }
+            if (right != null) { try { Require(desktops.RemoveDesktop(right), "remove right navigation desktop"); } finally { ComRelease.Release(right); } }
+            if (left != null) { try { Require(desktops.RemoveDesktop(left), "remove left navigation desktop"); } finally { ComRelease.Release(left); } }
+        }
+        Require(desktops.GetDesktopCount() == before && desktops.GetCurrentDesktopId() == originalId,
+            "navigation test restores desktop state");
+    }
+
+    private static void RenderSettings()
+    {
+        using var settings = new SettingsDialog(new AppSettings());
+        settings.Show();
+        Pump(100);
+        using var bitmap = new Bitmap(settings.Width, settings.Height);
+        settings.DrawToBitmap(bitmap, new Rectangle(Point.Empty, settings.Size));
+        Directory.CreateDirectory("artifacts");
+        bitmap.Save("artifacts/settings.png", System.Drawing.Imaging.ImageFormat.Png);
+        settings.Close();
+        Console.WriteLine("PASS: settings dialog rendered to artifacts/settings.png");
     }
 
     private static void RunAutomaticLifecycle(VirtualDesktopService desktops)

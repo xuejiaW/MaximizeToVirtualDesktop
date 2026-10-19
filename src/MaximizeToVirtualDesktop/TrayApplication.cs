@@ -23,10 +23,11 @@ internal sealed class TrayApplication : Form
     private readonly FullScreenManager _manager;
     private readonly WindowMonitor _monitor;
     private readonly MaximizeButtonHook _mouseHook;
+    private readonly DesktopNavigationHotkeys _navigation;
     private readonly System.Windows.Forms.Timer _cleanupTimer;
     private System.Windows.Forms.Timer? _retryTimer;
 
-    internal static readonly UpdatumManager Updater = new("shanselman", "MaximizeToVirtualDesktop")
+    internal static readonly UpdatumManager Updater = new("xuejiaW", "MaximizeToVirtualDesktop")
     {
         FetchOnlyLatestRelease = true,
         InstallUpdateSingleFileExecutableName = "MaximizeToVirtualDesktop",
@@ -50,6 +51,10 @@ internal sealed class TrayApplication : Form
         _manager = new FullScreenManager(_vds, _tracker, _settings);
         _monitor = new WindowMonitor(_manager, _tracker, this, _settings);
         _mouseHook = new MaximizeButtonHook(_manager, this, _settings);
+        _navigation = new DesktopNavigationHotkeys(right =>
+        {
+            if (_comInitialized) _vds.SwitchAdjacentDesktop(right);
+        });
 
         // System tray icon
         _trayIcon = new NotifyIcon
@@ -75,7 +80,7 @@ internal sealed class TrayApplication : Form
 
         if (buildNumber < 19045)
         {
-            // Not Windows 11 at all
+            // Older Windows builds have different private desktop interfaces.
             MessageBox.Show(
                 "MaximizeToVirtualDesktop requires Windows 10 22H2 or Windows 11.\n\n" +
                 $"Your system is running Windows build {buildNumber}.\n" +
@@ -150,28 +155,30 @@ internal sealed class TrayApplication : Form
         _mouseHook.Install();
         _cleanupTimer.Start();
 
-        // Register hotkey if not already registered
-        if (!NativeMethods.RegisterHotKey(Handle, HOTKEY_ID,
-            _settings.HotkeyModifiers | NativeMethods.MOD_NOREPEAT,
-            _settings.HotkeyKey))
-        {
-            Trace.WriteLine("TrayApplication: Failed to register hotkey (may already be registered).");
-        }
-        else
-        {
-            Trace.WriteLine($"TrayApplication: Registered hotkey {FormatHotkey(_settings.HotkeyModifiers, _settings.HotkeyKey)}");
-        }
+        RegisterConfiguredHotkeys();
+    }
 
-        if (!NativeMethods.RegisterHotKey(Handle, HOTKEY_PIN_ID,
-            _settings.PinHotkeyModifiers | NativeMethods.MOD_NOREPEAT,
-            _settings.PinHotkeyKey))
+    private List<string> RegisterConfiguredHotkeys()
+    {
+        foreach (int id in new[] { HOTKEY_ID, HOTKEY_PIN_ID })
+            NativeMethods.UnregisterHotKey(Handle, id);
+        var failures = new List<string>();
+        void Register(int id, uint modifiers, uint key, string name)
         {
-            Trace.WriteLine("TrayApplication: Failed to register pin hotkey.");
+            if (!NativeMethods.RegisterHotKey(Handle, id, modifiers | NativeMethods.MOD_NOREPEAT, key))
+                failures.Add(name);
         }
-        else
+        Register(HOTKEY_ID, _settings.HotkeyModifiers, _settings.HotkeyKey, "Maximize hotkey");
+        Register(HOTKEY_PIN_ID, _settings.PinHotkeyModifiers, _settings.PinHotkeyKey, "Pin hotkey");
+        failures.AddRange(_navigation.Configure(_settings.EnableDesktopNavigation));
+        if (failures.Count != 0)
         {
-            Trace.WriteLine($"TrayApplication: Registered pin hotkey {FormatHotkey(_settings.PinHotkeyModifiers, _settings.PinHotkeyKey)}");
+            Trace.WriteLine($"TrayApplication: Cannot register {string.Join(", ", failures)}.");
+            _trayIcon.BalloonTipTitle = "Shortcut already in use";
+            _trayIcon.BalloonTipText = $"Could not register: {string.Join(", ", failures)}. Change the conflicting app's shortcut or disable desktop navigation in Settings.";
+            _trayIcon.ShowBalloonTip(5000);
         }
+        return failures;
     }
 
     protected override void WndProc(ref Message m)
@@ -319,35 +326,9 @@ internal sealed class TrayApplication : Form
                 "Save Failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
-        // Re-register hotkeys with the new configuration
-        NativeMethods.UnregisterHotKey(Handle, HOTKEY_ID);
-        NativeMethods.UnregisterHotKey(Handle, HOTKEY_PIN_ID);
-
-        if (_comInitialized)
-        {
-            var failures = new List<string>();
-            if (!NativeMethods.RegisterHotKey(Handle, HOTKEY_ID,
-                _settings.HotkeyModifiers | NativeMethods.MOD_NOREPEAT,
-                _settings.HotkeyKey))
-            {
-                Trace.WriteLine("TrayApplication: Failed to register hotkey after settings change.");
-                failures.Add("Maximize hotkey");
-            }
-            if (!NativeMethods.RegisterHotKey(Handle, HOTKEY_PIN_ID,
-                _settings.PinHotkeyModifiers | NativeMethods.MOD_NOREPEAT,
-                _settings.PinHotkeyKey))
-            {
-                Trace.WriteLine("TrayApplication: Failed to register pin hotkey after settings change.");
-                failures.Add("Pin hotkey");
-            }
-            if (failures.Count > 0)
-            {
-                MessageBox.Show(
-                    $"Could not register: {string.Join(", ", failures)}.\n\nThe shortcut may already be in use by another application.",
-                    "Hotkey Registration Failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            }
-        }
-
+        if (_comInitialized) RegisterConfiguredHotkeys();
+        if (_settings.AutoManageMaximizedWindows && _settings.ManageExistingWindowsOnStart)
+            _monitor.ScanExistingWindows();
         _trayIcon.Text = BuildTooltipText();
         Trace.WriteLine("TrayApplication: Settings saved and hotkeys updated.");
     }
@@ -419,7 +400,7 @@ internal sealed class TrayApplication : Form
 
             var maximizeKey = FormatHotkey(_settings.HotkeyModifiers, _settings.HotkeyKey);
             var pinKey = FormatHotkey(_settings.PinHotkeyModifiers, _settings.PinHotkeyKey);
-            var clickDesc = _settings.InvertShiftClick ? "Click" : "Shift+Click";
+            var clickDesc = _settings.AutoManageMaximizedWindows || _settings.InvertShiftClick ? "Click" : "Shift+Click";
 
             _trayIcon.BalloonTipTitle = "Maximize to Virtual Desktop";
             _trayIcon.BalloonTipText =
@@ -471,16 +452,25 @@ internal sealed class TrayApplication : Form
 
         var maximizeKey = FormatHotkey(settings.HotkeyModifiers, settings.HotkeyKey);
         var pinKey = FormatHotkey(settings.PinHotkeyModifiers, settings.PinHotkeyKey);
-        var clickDesc = settings.InvertShiftClick
+        var clickDesc = settings.AutoManageMaximizedWindows || settings.InvertShiftClick
             ? "Click maximize button"
             : "Shift + Click maximize button";
-        var clickInstruction = settings.InvertShiftClick
+        var clickInstruction = settings.AutoManageMaximizedWindows || settings.InvertShiftClick
             ? "Click any window's maximize button. Hold Shift for a normal maximize."
             : "Hold Shift and click any window's maximize button.";
 
         AppendSection(rtb, "Maximize a Window to Its Own Desktop",
             (maximizeKey, "Toggles the focused window to/from its own virtual desktop."),
             (clickDesc, clickInstruction));
+
+        if (settings.AutoManageMaximizedWindows)
+            AppendSection(rtb, "Automatic Mode",
+                ("Maximize", "Use the maximize button, title bar, or Win+Up. Hold Shift to bypass automatic placement."),
+                ("Excluded apps", "List apps in Settings to leave their windows on their current desktop."));
+        if (settings.EnableDesktopNavigation)
+            AppendSection(rtb, "Switch Desktops",
+                ("Ctrl+[", "Switch to the desktop on the left."),
+                ("Ctrl+]", "Switch to the desktop on the right. Navigation stops at the edge."));
 
         AppendSection(rtb, "Pin a Window to All Desktops",
             (pinKey, "Toggles pin/unpin so the focused window appears on every desktop."));
@@ -544,7 +534,7 @@ internal sealed class TrayApplication : Form
     {
         var maximize = FormatHotkey(_settings.HotkeyModifiers, _settings.HotkeyKey);
         var pin = FormatHotkey(_settings.PinHotkeyModifiers, _settings.PinHotkeyKey);
-        var click = _settings.InvertShiftClick ? "Click maximize" : "Shift+Click maximize";
+        var click = _settings.AutoManageMaximizedWindows || _settings.InvertShiftClick ? "Click maximize" : "Shift+Click maximize";
         return $"Maximize to Virtual Desktop\n{maximize} | {click} | {pin} to pin";
     }
 
@@ -579,8 +569,9 @@ internal sealed class TrayApplication : Form
             var desktop = _vds.FindDesktop(entry.TempDesktopId);
             if (desktop != null)
             {
-                Trace.WriteLine($"TrayApplication: Removing orphaned desktop {entry.TempDesktopId} ({entry.ProcessName ?? "unknown"})");
-                _vds.RemoveDesktop(desktop);
+                // A crash may leave real application windows on this desktop.
+                // Preserve occupied desktops instead of relocating those windows.
+                if (!_vds.HasApplicationWindows(entry.TempDesktopId)) _vds.RemoveDesktop(desktop);
                 ComRelease.Release(desktop);
             }
         }
@@ -599,12 +590,16 @@ internal sealed class TrayApplication : Form
         _cleanupTimer.Stop();
         _cleanupTimer.Dispose();
 
-        // Restore all tracked windows before exiting
+        // Stop event producers before restoring windows, so shutdown cannot
+        // automatically adopt a window again while desktop cleanup runs.
+        _monitor.Dispose();
+        _mouseHook.Dispose();
         _manager.RestoreAll();
 
         // Clean up native resources
         NativeMethods.UnregisterHotKey(Handle, HOTKEY_ID);
         NativeMethods.UnregisterHotKey(Handle, HOTKEY_PIN_ID);
+        _navigation.Dispose();
         _mouseHook.Dispose();
         _monitor.Dispose();
         _vds.Dispose();

@@ -20,7 +20,7 @@ internal static class WindowEligibility
         {
             using var process = Process.GetProcessById(processId);
             return !(settings.ExcludedProcesses ?? []).Any(name =>
-                string.Equals(Path.GetFileNameWithoutExtension(name.Trim()), process.ProcessName,
+                string.Equals(Path.GetFileNameWithoutExtension(name?.Trim()), process.ProcessName,
                     StringComparison.OrdinalIgnoreCase));
         }
         catch (ArgumentException) { return false; }
