@@ -6,8 +6,9 @@ using MaximizeToVirtualDesktop.Interop;
 internal static class Program
 {
     [STAThread]
-    static int Main()
+    static int Main(string[] args)
     {
+        if (args.Contains("--child-window")) return RunChildWindow();
         System.Diagnostics.Trace.Listeners.Add(new System.Diagnostics.TextWriterTraceListener(Console.Out));
         System.Diagnostics.Trace.AutoFlush = true;
         Application.EnableVisualStyles();
@@ -39,8 +40,102 @@ internal static class Program
         Console.WriteLine("PASS: desktop interface smoke test");
         RunAutomaticLifecycle(desktops);
         RunNavigation(desktops);
+        RunCrossProcess(desktops);
         RenderSettings();
         return 0;
+    }
+
+    private static int RunChildWindow()
+    {
+        Application.EnableVisualStyles();
+        using var form = new Form { Text = "MVD external smoke window", Size = new(640, 400) };
+        Console.WriteLine(form.Handle.ToInt64());
+        Console.Out.Flush();
+        _ = Task.Run(() =>
+        {
+            string? command;
+            while ((command = Console.ReadLine()) != null)
+            {
+                string requested = command;
+                try
+                {
+                    form.BeginInvoke(() =>
+                    {
+                        if (requested == "maximize") form.WindowState = FormWindowState.Maximized;
+                        else if (requested == "restore") form.WindowState = FormWindowState.Normal;
+                        else if (requested == "close") form.Close();
+                    });
+                }
+                catch (InvalidOperationException) { break; }
+                if (requested == "close") break;
+            }
+        });
+        Application.Run(form);
+        return 0;
+    }
+
+    private static void RunCrossProcess(VirtualDesktopService desktops)
+    {
+        int before = desktops.GetDesktopCount();
+        Guid originalId = desktops.GetCurrentDesktopId()!.Value;
+        using var child = Process.Start(new ProcessStartInfo(Environment.ProcessPath!, "--child-window")
+        {
+            UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true,
+            CreateNoWindow = true
+        })!;
+        var desktopIds = new HashSet<Guid>();
+        var settings = new AppSettings { AutoManageMaximizedWindows = true, ShowSwitchPopup = false };
+        var tracker = new FullScreenTracker(persist: false);
+        var manager = new FullScreenManager(desktops, tracker, settings);
+        using var controller = new Control();
+        _ = controller.Handle;
+        WindowMonitor? monitor = null;
+        try
+        {
+            string? handleText = child.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
+            var hwnd = new IntPtr(long.Parse(handleText!));
+            monitor = new WindowMonitor(manager, tracker, controller, settings,
+                candidate => candidate == hwnd && WindowEligibility.IsApplicationWindow(candidate, settings));
+            monitor.Start();
+            child.StandardInput.WriteLine("maximize");
+            child.StandardInput.Flush();
+            WaitUntil(() => tracker.IsTracked(hwnd), "cross-process maximize is adopted");
+            var entry = tracker.Get(hwnd)!;
+            desktopIds.Add(entry.TempDesktopId);
+            Require(desktops.GetDesktopIdForWindow(hwnd) == entry.TempDesktopId, "cross-process window moves to its own desktop");
+            child.StandardInput.WriteLine("restore");
+            child.StandardInput.Flush();
+            WaitUntil(() => tracker.Count == 0, "cross-process restore cleans desktop");
+            Require(desktops.GetDesktopIdForWindow(hwnd) == originalId, "cross-process window returns to original desktop");
+            child.StandardInput.WriteLine("maximize");
+            child.StandardInput.Flush();
+            WaitUntil(() => tracker.IsTracked(hwnd), "cross-process window can enter again");
+            desktopIds.Add(tracker.Get(hwnd)!.TempDesktopId);
+            child.StandardInput.WriteLine("close");
+            child.StandardInput.Flush();
+            WaitUntil(() => child.HasExited && tracker.Count == 0, "cross-process exit cleans desktop");
+        }
+        finally
+        {
+            monitor?.Dispose();
+            manager.RestoreAll();
+            if (!child.HasExited)
+            {
+                child.StandardInput.WriteLine("close");
+                child.StandardInput.Flush();
+                if (!child.WaitForExit(3000)) { child.Kill(); child.WaitForExit(); }
+            }
+            var original = desktops.FindDesktop(originalId);
+            try { if (original != null) desktops.SwitchToDesktop(original); }
+            finally { if (original != null) ComRelease.Release(original); }
+            foreach (var id in desktopIds)
+            {
+                var desktop = desktops.FindDesktop(id);
+                if (desktop != null) { try { desktops.RemoveDesktop(desktop); } finally { ComRelease.Release(desktop); } }
+            }
+        }
+        Require(desktops.GetDesktopCount() == before && desktops.GetCurrentDesktopId() == originalId,
+            "cross-process tests restore desktop state");
     }
 
     private static void RunNavigation(VirtualDesktopService desktops)
