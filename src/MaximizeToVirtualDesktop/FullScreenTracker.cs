@@ -19,6 +19,8 @@ internal sealed record TrackingEntry(
 /// </summary>
 internal sealed class FullScreenTracker
 {
+    private readonly bool _persist;
+    public FullScreenTracker(bool persist = true) => _persist = persist;
     private readonly Dictionary<IntPtr, TrackingEntry> _entries = new();
     private readonly object _lock = new();
 
@@ -79,7 +81,7 @@ internal sealed class FullScreenTracker
             _entries.Clear();
             Trace.WriteLine($"FullScreenTracker: Cleared {count} stale entries (Explorer restart).");
         }
-        TrackerPersistence.Delete();
+        if (_persist) TrackerPersistence.Delete();
     }
 
     /// <summary>Returns all tracked entries (snapshot).</summary>
@@ -106,6 +108,7 @@ internal sealed class FullScreenTracker
 
     private void PersistToDisk()
     {
+        if (!_persist) return;
         List<TrackerPersistence.PersistedEntry> snapshot;
         lock (_lock)
         {

@@ -2,4 +2,8 @@
   <Folder Name="/src/">
     <Project Path="src/MaximizeToVirtualDesktop/MaximizeToVirtualDesktop.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/MaximizeToVirtualDesktop.Tests/MaximizeToVirtualDesktop.Tests.csproj" />
+    <Project Path="tests/MaximizeToVirtualDesktop.SmokeTests/MaximizeToVirtualDesktop.SmokeTests.csproj" />
+  </Folder>
 </Solution>

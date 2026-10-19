@@ -34,6 +34,11 @@ internal sealed class AppSettings
     /// </summary>
     public bool InvertShiftClick { get; set; } = false;
 
+    public bool AutoManageMaximizedWindows { get; set; } = true;
+    public bool ManageExistingWindowsOnStart { get; set; } = false;
+    public bool EnableDesktopNavigation { get; set; } = true;
+    public string[] ExcludedProcesses { get; set; } = [];
+
     /// <summary>
     /// When true, show on-screen popup notifications when switching windows to/from virtual desktops.
     /// </summary>

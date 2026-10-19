@@ -4,6 +4,21 @@ namespace MaximizeToVirtualDesktop.Interop;
 
 internal static partial class NativeMethods
 {
+    [DllImport("user32.dll")]
+    internal static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+    internal static extern int GetWindowLong(IntPtr hwnd, int index);
+    [DllImport("dwmapi.dll")]
+    internal static extern int DwmGetWindowAttribute(IntPtr hwnd, uint attribute, out int value, int size);
+
+    internal const uint EVENT_OBJECT_SHOW = 0x8002;
+    internal const uint GA_ROOT = 2;
+    internal const int GWL_EXSTYLE = -20;
+    internal const int WS_EX_TOOLWINDOW = 0x80;
+    internal const int WS_EX_NOACTIVATE = 0x08000000;
+    internal const uint DWMWA_CLOAKED = 14;
+    internal const uint VK_OEM_4 = 0xDB;
+    internal const uint VK_OEM_6 = 0xDD;
     // --- Window Management ---
 
     [DllImport("user32.dll")]

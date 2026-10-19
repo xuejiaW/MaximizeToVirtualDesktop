@@ -100,6 +100,21 @@ internal sealed class VirtualDesktopService : IDisposable
 
     public int GetDesktopCount() => _managerInternal?.GetCount() ?? 0;
 
+    public bool HasApplicationWindows(Guid desktopId, IntPtr ignoredWindow = default)
+    {
+        bool found = false;
+        NativeMethods.EnumWindows((hwnd, _) =>
+        {
+            if (hwnd == ignoredWindow || !NativeMethods.IsWindowVisible(hwnd)
+                || NativeMethods.GetWindow(hwnd, NativeMethods.GW_OWNER) != IntPtr.Zero) return true;
+            int style = NativeMethods.GetWindowLong(hwnd, NativeMethods.GWL_EXSTYLE);
+            if ((style & (NativeMethods.WS_EX_TOOLWINDOW | NativeMethods.WS_EX_NOACTIVATE)) != 0) return true;
+            if (GetDesktopIdForWindow(hwnd) == desktopId && !IsWindowPinned(hwnd)) found = true;
+            return !found;
+        }, IntPtr.Zero);
+        return found;
+    }
+
     public bool SwitchAdjacentDesktop(bool right)
     {
         IVirtualDesktop? current = null;
@@ -185,33 +200,10 @@ internal sealed class VirtualDesktopService : IDisposable
             Trace.WriteLine($"VirtualDesktopService: MoveWindowToDesktop failed for hwnd={hwnd}: {ex.GetType().Name}: {ex.Message}");
             if (view != null) { ComRelease.Release(view); view = null; }
 
-            // Second attempt: try main window of the process
-            IApplicationView? fallbackView = null;
-            try
-            {
-                NativeMethods.GetWindowThreadProcessId(hwnd, out int processId);
-                using var process = Process.GetProcessById(processId);
-                if (process.MainWindowHandle != IntPtr.Zero && process.MainWindowHandle != hwnd)
-                {
-                    _viewCollection?.GetViewForHwnd(process.MainWindowHandle, out fallbackView);
-                    if (fallbackView != null)
-                    {
-                        _managerInternal!.MoveViewToDesktop(fallbackView, desktop);
-                        Trace.WriteLine($"VirtualDesktopService: Moved main window instead for process {processId}");
-                        return true;
-                    }
-                }
-            }
-            catch (Exception ex2)
-            {
-                Trace.WriteLine($"VirtualDesktopService: Fallback move also failed: {ex2.Message}");
-            }
-            finally
-            {
-                if (fallbackView != null) ComRelease.Release(fallbackView);
-            }
-
+            // Do not substitute a sibling/main window: Explorer and browsers can
+            // have several unrelated windows in the same process.
             return false;
+
         }
         finally
         {

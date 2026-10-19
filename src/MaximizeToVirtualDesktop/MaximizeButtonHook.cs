@@ -49,6 +49,10 @@ internal sealed class MaximizeButtonHook : IDisposable
 
     private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
+        // Automatic mode handles actual state changes, avoiding a second trigger
+        // from intercepting the same click before the window maximizes.
+        if (_settings.AutoManageMaximizedWindows)
+            return NativeMethods.CallNextHookEx(_hookHandle, nCode, wParam, lParam);
         if (nCode >= NativeMethods.HC_ACTION && wParam == (IntPtr)NativeMethods.WM_LBUTTONDOWN)
         {
             bool shiftHeld = (NativeMethods.GetAsyncKeyState(NativeMethods.VK_SHIFT) & 0x8000) != 0;

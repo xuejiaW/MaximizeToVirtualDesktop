@@ -1,355 +1,145 @@
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 using MaximizeToVirtualDesktop.Interop;
 
 namespace MaximizeToVirtualDesktop;
 
-/// <summary>
-/// Orchestrates the "maximize to virtual desktop" and "restore from virtual desktop" flows.
-/// Every mutating step has rollback if the next step fails.
-/// </summary>
-internal sealed class FullScreenManager
+internal sealed class FullScreenManager(VirtualDesktopService desktops, FullScreenTracker tracker, AppSettings settings)
 {
-    private readonly VirtualDesktopService _vds;
-    private readonly FullScreenTracker _tracker;
-    private readonly AppSettings _settings;
-    private readonly HashSet<IntPtr> _inFlight = new();
-    // Track temp desktop COM refs that have already been released to prevent double-release.
-    // Multiple tracked windows may share the same TempDesktop COM pointer.
-    private readonly HashSet<Guid> _releasedDesktops = new();
+    private readonly VirtualDesktopService _vds = desktops;
+    private readonly FullScreenTracker _tracker = tracker;
+    private readonly AppSettings _settings = settings;
+    private readonly HashSet<IntPtr> _inFlight = [];
 
-    public FullScreenManager(VirtualDesktopService vds, FullScreenTracker tracker, AppSettings settings)
-    {
-        _vds = vds;
-        _tracker = tracker;
-        _settings = settings;
-    }
+    public bool IsBusy(IntPtr hwnd) => _inFlight.Contains(hwnd);
+    public bool CanAutomaticallyManage(IntPtr hwnd) => !_vds.IsWindowPinned(hwnd)
+        && _vds.GetDesktopIdForWindow(hwnd) is Guid id && id != Guid.Empty && id == _vds.GetCurrentDesktopId();
 
-    /// <summary>
-    /// Toggle: if window is tracked, restore it. Otherwise, maximize it to a new desktop.
-    /// </summary>
     public void Toggle(IntPtr hwnd)
     {
-        if (!NativeMethods.IsWindow(hwnd))
-        {
-            Trace.WriteLine($"FullScreenManager: hwnd {hwnd} is not a valid window, ignoring.");
-            return;
-        }
-
-        if (!_inFlight.Add(hwnd))
-        {
-            Trace.WriteLine($"FullScreenManager: hwnd {hwnd} already in-flight, ignoring.");
-            return;
-        }
-
-        try
-        {
-            if (_tracker.IsTracked(hwnd))
-            {
-                Restore(hwnd);
-            }
-            else
-            {
-                MaximizeToDesktop(hwnd);
-            }
-        }
-        finally
-        {
-            _inFlight.Remove(hwnd);
-        }
+        if (_tracker.IsTracked(hwnd)) Restore(hwnd);
+        else MaximizeToDesktop(hwnd);
     }
 
-    /// <summary>
-    /// Send a window to a new virtual desktop, maximized.
-    /// Only the clicked window is moved; other windows from the same process are not affected.
-    /// </summary>
     public void MaximizeToDesktop(IntPtr hwnd)
     {
-        if (!NativeMethods.IsWindow(hwnd))
-        {
-            Trace.WriteLine($"FullScreenManager: hwnd {hwnd} is not valid, aborting maximize.");
-            return;
-        }
-
-        if (_tracker.IsTracked(hwnd))
-        {
-            Trace.WriteLine($"FullScreenManager: hwnd {hwnd} already tracked, toggling to restore.");
-            Restore(hwnd);
-            return;
-        }
-
-        // 1. Move only the clicked window
-        var allWindows = new List<IntPtr> { hwnd };
-
-        // 2. Record original state for all windows
-        var originalDesktopId = _vds.GetDesktopIdForWindow(hwnd);
-        if (originalDesktopId == null)
-        {
-            Trace.WriteLine("FullScreenManager: Could not determine original desktop, aborting.");
-            return;
-        }
-
-        var originalPlacement = NativeMethods.WINDOWPLACEMENT.Default;
-        if (!NativeMethods.GetWindowPlacement(hwnd, ref originalPlacement))
-        {
-            Trace.WriteLine("FullScreenManager: Could not get window placement, aborting.");
-            return;
-        }
-
-        // 3. Create new virtual desktop
-        var (tempDesktop, tempDesktopId) = _vds.CreateDesktop();
-        if (tempDesktop == null || tempDesktopId == null)
-        {
-            Trace.WriteLine("FullScreenManager: Failed to create desktop, aborting.");
-            return;
-        }
-
-        // 4. Name the desktop after the window title (or process name as fallback)
-        string? processName = null;
-        try
-        {
-            NativeMethods.GetWindowThreadProcessId(hwnd, out int processId);
-            using var process = Process.GetProcessById(processId);
-            processName = !string.IsNullOrWhiteSpace(process.MainWindowTitle)
-                ? process.MainWindowTitle
-                : process.ProcessName;
-            _vds.SetDesktopName(tempDesktop, $"[MVD] {processName}");
-        }
-        catch
-        {
-            // Non-critical, continue
-        }
-
-        // 5. Move all windows to new desktop
-        var movedWindows = new List<IntPtr>();
-        foreach (var window in allWindows)
-        {
-            if (_vds.MoveWindowToDesktop(window, tempDesktop))
-            {
-                movedWindows.Add(window);
-            }
-            else if (window == hwnd)
-            {
-                // Primary window failed — must rollback
-                Trace.WriteLine($"FullScreenManager: Failed to move primary window {window}, rolling back.");
-                var origDesktop = _vds.FindDesktop(originalDesktopId.Value);
-                try
-                {
-                    if (origDesktop != null)
-                    {
-                        foreach (var movedWindow in movedWindows)
-                        {
-                            _vds.MoveWindowToDesktop(movedWindow, origDesktop);
-                        }
-                    }
-                }
-                finally
-                {
-                    if (origDesktop != null) ComRelease.Release(origDesktop);
-                }
-                _vds.RemoveDesktop(tempDesktop);
-                ComRelease.Release(tempDesktop);
-                return;
-            }
-            else
-            {
-                // Secondary window failed — skip it, not critical
-                Trace.WriteLine($"FullScreenManager: Skipping secondary window {window} (move failed).");
-            }
-        }
-
-        // 6. Switch to the new desktop
-        if (!_vds.SwitchToDesktop(tempDesktop))
-        {
-            // Rollback: move all windows back, remove desktop
-            Trace.WriteLine("FullScreenManager: Failed to switch desktop, rolling back.");
-            var origDesktop = _vds.FindDesktop(originalDesktopId.Value);
-            try
-            {
-                if (origDesktop != null)
-                {
-                    foreach (var window in movedWindows)
-                    {
-                        _vds.MoveWindowToDesktop(window, origDesktop);
-                    }
-                }
-            }
-            finally
-            {
-                if (origDesktop != null) ComRelease.Release(origDesktop);
-            }
-            _vds.RemoveDesktop(tempDesktop);
-            ComRelease.Release(tempDesktop);
-            return;
-        }
-
-        // 7. Maximize the primary window — delay lets desktop switch animation finish first
-        bool elevated = NativeMethods.IsWindowElevated(hwnd);
-        if (elevated)
-        {
-            Trace.WriteLine("FullScreenManager: Window is elevated, cannot maximize via UIPI.");
-            if (_settings.ShowSwitchPopup)
-            {
-                NotificationOverlay.ShowNotification("⚠ Elevated Window",
-                    "Press Win+↑ to maximize", hwnd);
-            }
-        }
-        else
-        {
-            Thread.Sleep(250);
-            NativeMethods.ShowWindow(hwnd, NativeMethods.SW_MAXIMIZE);
-        }
-        NativeMethods.SetForegroundWindow(hwnd);
-
-        // 8. Track the window
-        _tracker.Track(hwnd, originalDesktopId.Value, tempDesktopId.Value, tempDesktop, processName, originalPlacement);
-
-        if (_settings.ShowSwitchPopup)
-        {
-            NotificationOverlay.ShowNotification("→ Virtual Desktop", processName ?? "", hwnd);
-        }
-        Trace.WriteLine($"FullScreenManager: Successfully moved window to desktop {tempDesktopId}");
+        // Enter is idempotent. Only the explicit Toggle operation may restore.
+        if (!NativeMethods.IsWindow(hwnd) || _tracker.IsTracked(hwnd) || !_inFlight.Add(hwnd)) return;
+        try { EnterCore(hwnd); }
+        finally { _inFlight.Remove(hwnd); }
     }
 
-    /// <summary>
-    /// Restore a tracked window: move it back to its original desktop, restore window state,
-    /// switch back, and remove the temp desktop.
-    /// </summary>
-    public void Restore(IntPtr hwnd)
+    private void EnterCore(IntPtr hwnd)
+    {
+        var originalId = _vds.GetDesktopIdForWindow(hwnd);
+        var originalPlacement = NativeMethods.WINDOWPLACEMENT.Default;
+        if (originalId is null || originalId == Guid.Empty || !NativeMethods.GetWindowPlacement(hwnd, ref originalPlacement)) return;
+        var (desktop, desktopId) = _vds.CreateDesktop();
+        if (desktop == null || desktopId == null) return;
+        bool tracked = false;
+        try
+        {
+            if (!_vds.MoveWindowToDesktop(hwnd, desktop)) return;
+            string processName = "Window";
+            try
+            {
+                NativeMethods.GetWindowThreadProcessId(hwnd, out int pid);
+                using var process = Process.GetProcessById(pid);
+                processName = string.IsNullOrWhiteSpace(process.MainWindowTitle) ? process.ProcessName : process.MainWindowTitle;
+            }
+            catch (ArgumentException) { }
+            _vds.SetDesktopName(desktop, $"[MVD] {processName}");
+            // Track before changing focus or size so event callbacks cannot enter twice.
+            _tracker.Track(hwnd, originalId.Value, desktopId.Value, desktop, processName, originalPlacement);
+            tracked = true;
+            if (!_vds.SwitchToDesktop(desktop)) { RestoreCore(hwnd, true); return; }
+            if (!NativeMethods.IsWindowElevated(hwnd)) NativeMethods.ShowWindow(hwnd, NativeMethods.SW_MAXIMIZE);
+            NativeMethods.SetForegroundWindow(hwnd);
+            if (_settings.ShowSwitchPopup) NotificationOverlay.ShowNotification("→ Virtual Desktop", processName, hwnd);
+        }
+        finally
+        {
+            if (!tracked)
+            {
+                _vds.RemoveDesktop(desktop);
+                ComRelease.Release(desktop);
+            }
+        }
+    }
+
+    public void Restore(IntPtr hwnd, bool preserveWindowState = false)
+    {
+        if (!_tracker.IsTracked(hwnd) || !_inFlight.Add(hwnd)) return;
+        try { RestoreCore(hwnd, preserveWindowState); }
+        finally { _inFlight.Remove(hwnd); }
+    }
+
+    private void RestoreCore(IntPtr hwnd, bool preserveWindowState)
     {
         var entry = _tracker.Get(hwnd);
-        if (entry == null)
-        {
-            Trace.WriteLine($"FullScreenManager: hwnd {hwnd} not tracked, ignoring restore.");
-            return;
-        }
-
-        Trace.WriteLine($"FullScreenManager: Restoring window {hwnd} from temp desktop {entry.TempDesktopId}");
-
-        // Untrack will be performed after successful restore
-
-        var origDesktop = _vds.FindDesktop(entry.OriginalDesktopId);
+        if (entry == null) return;
+        bool wasCurrent = _vds.GetCurrentDesktopId() == entry.TempDesktopId;
+        var original = _vds.FindDesktop(entry.OriginalDesktopId);
         try
         {
-            // Restore window placement
-            if (NativeMethods.IsWindow(hwnd))
+            // A failed move must leave the tracking/recovery entry intact.
+            if (original != null && NativeMethods.IsWindow(hwnd) && !_vds.MoveWindowToDesktop(hwnd, original)) return;
+            if (!preserveWindowState && NativeMethods.IsWindow(hwnd))
             {
                 var placement = entry.OriginalPlacement;
+                placement.showCmd = NativeMethods.SW_SHOWNORMAL;
                 NativeMethods.SetWindowPlacement(hwnd, ref placement);
-                // Ensure the window is shown in its normal (not maximized) state
                 NativeMethods.ShowWindow(hwnd, (int)NativeMethods.SW_SHOWNORMAL);
             }
-
-            // Move window back to original desktop
-            if (origDesktop != null && NativeMethods.IsWindow(hwnd))
-            {
-                _vds.MoveWindowToDesktop(hwnd, origDesktop);
-            }
-
-            // Switch back to original desktop
-            if (origDesktop != null)
-            {
-                _vds.SwitchToDesktop(origDesktop);
-            }
-            else
-            {
-                Trace.WriteLine("FullScreenManager: Original desktop no longer exists, leaving window on current.");
-            }
+            if (wasCurrent && original != null) _vds.SwitchToDesktop(original);
+            if (!FinishDesktop(entry, hwnd)) return;
+            if (wasCurrent && NativeMethods.IsWindow(hwnd)) NativeMethods.SetForegroundWindow(hwnd);
         }
-        finally
-        {
-            if (origDesktop != null) ComRelease.Release(origDesktop);
-        }
-
-        // Remove temp desktop and release its COM reference
-        if (_releasedDesktops.Add(entry.TempDesktopId))
-        {
-            _vds.RemoveDesktop(entry.TempDesktop);
-            ComRelease.Release(entry.TempDesktop);
-        }
-      
-        _tracker.Untrack(hwnd);
-
-        // Set focus on the restored window
-        if (NativeMethods.IsWindow(hwnd))
-        {
-            NativeMethods.SetForegroundWindow(hwnd);
-        }
-
-        if (_settings.ShowSwitchPopup)
-        {
-            NotificationOverlay.ShowNotification("← Restored", entry.ProcessName ?? "", hwnd);
-        }
-        Trace.WriteLine($"FullScreenManager: Restored window to original desktop.");
+        finally { if (original != null) ComRelease.Release(original); }
     }
 
-    /// <summary>
-    /// Called when a tracked window is destroyed (closed). Clean up its temp desktop.
-    /// </summary>
+    private bool FinishDesktop(TrackingEntry entry, IntPtr ignoredWindow)
+    {
+        // Retain a desktop if the user placed another application there.
+        bool occupied = _vds.HasApplicationWindows(entry.TempDesktopId, ignoredWindow);
+        if (!occupied && !_vds.RemoveDesktop(entry.TempDesktop)) return false;
+        _tracker.Untrack(entry.Hwnd);
+        ComRelease.Release(entry.TempDesktop);
+        return true;
+    }
+
     public void HandleWindowDestroyed(IntPtr hwnd)
     {
-        var entry = _tracker.Untrack(hwnd);
-        if (entry == null) return;
-
-        Trace.WriteLine($"FullScreenManager: Tracked window {hwnd} destroyed.");
-
-        Trace.WriteLine($"FullScreenManager: Cleaning up temp desktop {entry.TempDesktopId}");
-
-        // Switch back to original desktop first
-        var origDesktop = _vds.FindDesktop(entry.OriginalDesktopId);
+        if (!_inFlight.Add(hwnd)) return;
         try
         {
-            if (origDesktop != null) _vds.SwitchToDesktop(origDesktop);
+            var entry = _tracker.Get(hwnd);
+            if (entry == null) return;
+            // Closing a background window must never pull the user off their desktop.
+            if (_vds.GetCurrentDesktopId() == entry.TempDesktopId)
+            {
+                var original = _vds.FindDesktop(entry.OriginalDesktopId);
+                try { if (original != null) _vds.SwitchToDesktop(original); }
+                finally { if (original != null) ComRelease.Release(original); }
+            }
+            FinishDesktop(entry, hwnd);
         }
-        finally
-        {
-            if (origDesktop != null) ComRelease.Release(origDesktop);
-        }
-
-        // Remove the temp desktop and release its COM reference
-        if (_releasedDesktops.Add(entry.TempDesktopId))
-        {
-            _vds.RemoveDesktop(entry.TempDesktop);
-            ComRelease.Release(entry.TempDesktop);
-        }
+        finally { _inFlight.Remove(hwnd); }
     }
 
-    /// <summary>
-    /// Clean up all tracked windows — called on app exit.
-    /// </summary>
     public void RestoreAll()
     {
-        var entries = _tracker.GetAll();
-        Trace.WriteLine($"FullScreenManager: Restoring {entries.Count} tracked window(s) on exit.");
-
-        foreach (var entry in entries)
+        foreach (var entry in _tracker.GetAll())
         {
-            try
-            {
-                Restore(entry.Hwnd);
-            }
-            catch (Exception ex)
-            {
-                Trace.WriteLine($"FullScreenManager: Error restoring {entry.Hwnd}: {ex.Message}");
-            }
+            try { Restore(entry.Hwnd); }
+            catch (Exception ex) { Trace.WriteLine($"FullScreenManager: Restore failed for {entry.Hwnd}: {ex.Message}"); }
         }
     }
 
-    /// <summary>
-    /// Remove stale entries for windows that no longer exist.
-    /// </summary>
     public void CleanupStaleEntries()
     {
-        var stale = _tracker.GetStaleHandles();
-        foreach (var hwnd in stale)
-        {
-            HandleWindowDestroyed(hwnd);
-        }
+        foreach (var hwnd in _tracker.GetStaleHandles()) HandleWindowDestroyed(hwnd);
     }
 
-    /// <summary>
-    /// Toggle pin/unpin of a window to all virtual desktops.
-    /// </summary>
     public void PinToggle(IntPtr hwnd)
     {
         if (!NativeMethods.IsWindow(hwnd))

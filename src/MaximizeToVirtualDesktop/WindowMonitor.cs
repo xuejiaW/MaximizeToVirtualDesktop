@@ -1,225 +1,110 @@
-using System.Diagnostics;
-using System.Collections.Generic;
-using System.Threading.Tasks;
 using MaximizeToVirtualDesktop.Interop;
 
 namespace MaximizeToVirtualDesktop;
 
-/// <summary>
-/// Uses SetWinEventHook to monitor tracked windows for state changes (un-maximize, close).
-/// All callbacks are marshaled to the UI thread.
-/// </summary>
+/// <summary>Coalesces native events and reconciles actual window state on the UI thread.</summary>
 internal sealed class WindowMonitor : IDisposable
 {
     private readonly FullScreenManager _manager;
     private readonly FullScreenTracker _tracker;
     private readonly Control _syncControl;
     private readonly AppSettings _settings;
-    private IntPtr _locationChangeHook;
-    private IntPtr _destroyHook;
+    private readonly Func<IntPtr, bool> _eligible;
+    private readonly AutomaticWindowPolicy _policy = new();
+    private readonly HashSet<IntPtr> _pending = [];
+    private readonly List<IntPtr> _hooks = [];
+    private readonly NativeMethods.WinEventProc _callback;
+    private readonly System.Windows.Forms.Timer _timer = new() { Interval = 200 };
     private bool _disposed;
 
-    // Must be stored as fields to prevent GC collection of the delegate
-    private readonly NativeMethods.WinEventProc _locationChangeProc;
-    private readonly NativeMethods.WinEventProc _destroyProc;
-    private readonly NativeMethods.WinEventProc _moveSizeEndProc;
-    private IntPtr _moveSizeEndHook;
-    // Track windows that have been maximized but need to wait for resize end
-    // Access to this set must happen only on the UI thread.
-    private readonly HashSet<IntPtr> _pendingMaximize = new();
-
-    public WindowMonitor(FullScreenManager manager, FullScreenTracker tracker, Control syncControl, AppSettings settings)
+    public WindowMonitor(FullScreenManager manager, FullScreenTracker tracker, Control syncControl,
+        AppSettings settings, Func<IntPtr, bool>? eligible = null)
     {
         _manager = manager;
         _tracker = tracker;
         _syncControl = syncControl;
         _settings = settings;
-
-        _locationChangeProc = OnLocationChange;
-        _destroyProc = OnDestroy;
-        _moveSizeEndProc = OnMoveSizeEnd;
+        _eligible = eligible ?? (hwnd => WindowEligibility.IsApplicationWindow(hwnd, settings));
+        _callback = OnEvent;
+        _timer.Tick += (_, _) => ReconcilePending();
     }
 
     public void Start()
     {
-        if (_locationChangeHook != IntPtr.Zero) return;
-
-        // EVENT_OBJECT_LOCATIONCHANGE fires when window state changes (including maximize/restore)
-        _locationChangeHook = NativeMethods.SetWinEventHook(
-            NativeMethods.EVENT_OBJECT_LOCATIONCHANGE,
-            NativeMethods.EVENT_OBJECT_LOCATIONCHANGE,
-            IntPtr.Zero, _locationChangeProc,
-            0, 0, NativeMethods.WINEVENT_OUTOFCONTEXT);
-
-        // EVENT_SYSTEM_MOVESIZEEND fires after a window finishes moving or resizing (including maximize via shortcuts)
-        _moveSizeEndHook = NativeMethods.SetWinEventHook(
-            NativeMethods.EVENT_SYSTEM_MOVESIZEEND,
-            NativeMethods.EVENT_SYSTEM_MOVESIZEEND,
-            IntPtr.Zero, _moveSizeEndProc,
-            0, 0, NativeMethods.WINEVENT_OUTOFCONTEXT);
-
-        // EVENT_OBJECT_DESTROY fires when a window is closed
-        _destroyHook = NativeMethods.SetWinEventHook(
-            NativeMethods.EVENT_OBJECT_DESTROY,
-            NativeMethods.EVENT_OBJECT_DESTROY,
-            IntPtr.Zero, _destroyProc,
-            0, 0, NativeMethods.WINEVENT_OUTOFCONTEXT);
-
-        if (_locationChangeHook == IntPtr.Zero || _destroyHook == IntPtr.Zero)
+        if (_disposed || _hooks.Count != 0) return;
+        foreach (uint eventId in new[] { NativeMethods.EVENT_OBJECT_LOCATIONCHANGE,
+            NativeMethods.EVENT_OBJECT_SHOW, NativeMethods.EVENT_OBJECT_DESTROY,
+            NativeMethods.EVENT_SYSTEM_MOVESIZEEND })
         {
-            Trace.WriteLine("WindowMonitor: Failed to set one or more WinEvent hooks.");
+            var hook = NativeMethods.SetWinEventHook(eventId, eventId, IntPtr.Zero,
+                _callback, 0, 0, NativeMethods.WINEVENT_OUTOFCONTEXT);
+            if (hook == IntPtr.Zero) { Dispose(); throw new InvalidOperationException($"Cannot monitor event {eventId:X}."); }
+            _hooks.Add(hook);
         }
-        else
-        {
-            Trace.WriteLine("WindowMonitor: Started monitoring.");
-        }
+        _timer.Start();
+        if (_settings.AutoManageMaximizedWindows && _settings.ManageExistingWindowsOnStart) ScanExistingWindows();
     }
 
-    private void OnLocationChange(IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
-        int idObject, int idChild, uint idEventThread, uint dwmsEventTime)
+    public void ScanExistingWindows() => NativeMethods.EnumWindows((hwnd, _) =>
     {
-        // Only care about top-level window changes (OBJID_WINDOW)
-        if (idObject != NativeMethods.OBJID_WINDOW || idChild != 0) return;
+        if (_eligible(hwnd)) _pending.Add(hwnd);
+        return true;
+    }, IntPtr.Zero);
 
-        // If the window is already tracked, check if it is being restored (i.e., no longer maximized)
-        if (_tracker.IsTracked(hwnd))
-        {
-            var placement = NativeMethods.WINDOWPLACEMENT.Default;
-            if (NativeMethods.GetWindowPlacement(hwnd, ref placement))
-            {
-                if (placement.showCmd != NativeMethods.SW_MAXIMIZE)
-                {
-                    Trace.WriteLine($"WindowMonitor: Tracked window {hwnd} restored via location change.");
-                    MarshalToUiThread(() => _manager.Restore(hwnd));
-                    return;
-                }
-            }
-            // Still maximized; let MoveSizeEnd handle pending maximize.
-            return;
-        }
-
-        // Not tracked yet: check for a new maximize event (including via shortcut)
-        var newPlacement = NativeMethods.WINDOWPLACEMENT.Default;
-        if (!NativeMethods.GetWindowPlacement(hwnd, ref newPlacement)) return;
-        if (newPlacement.showCmd != NativeMethods.SW_MAXIMIZE) return;
-
+    private void OnEvent(IntPtr hook, uint eventId, IntPtr hwnd, int objectId,
+        int childId, uint threadId, uint timestamp)
+    {
+        if (hwnd == IntPtr.Zero || objectId != NativeMethods.OBJID_WINDOW || childId != 0) return;
         bool shiftHeld = (NativeMethods.GetAsyncKeyState(NativeMethods.VK_SHIFT) & 0x8000) != 0;
-        bool triggerVirtualDesktop = _settings.InvertShiftClick ? !shiftHeld : shiftHeld;
-        if (triggerVirtualDesktop)
+        Post(() =>
         {
-            // Defer maximization until after the resize operation completes
-            MarshalToUiThread(() =>
+            if (eventId == NativeMethods.EVENT_OBJECT_DESTROY)
             {
-                if (_pendingMaximize.Add(hwnd))
-                {
-                    Trace.WriteLine($"WindowMonitor: Queued maximize for window {hwnd} after resize end.");
-                    // Schedule a fallback in case MoveSizeEnd does not fire (e.g., keyboard shortcut)
-                    _ = Task.Run(async () =>
-                    {
-                        await Task.Delay(200);
-                        // Marshal the check/remove back onto the UI thread
-                        MarshalToUiThread(() =>
-                        {
-                            if (_pendingMaximize.Contains(hwnd))
-                            {
-                                _pendingMaximize.Remove(hwnd);
-                                var placement = NativeMethods.WINDOWPLACEMENT.Default;
-                                bool isMaximized = NativeMethods.GetWindowPlacement(hwnd, ref placement) && placement.showCmd == NativeMethods.SW_MAXIMIZE;
-                                if (isMaximized)
-                                {
-                                    Trace.WriteLine($"WindowMonitor: Fallback processing for pending maximize window {hwnd}.");
-                                    _manager.MaximizeToDesktop(hwnd);
-                                }
-                                else
-                                {
-                                    Trace.WriteLine($"WindowMonitor: Fallback detected restore for pending window {hwnd}.");
-                                    _manager.Restore(hwnd);
-                                }
-                            }
-                        });
-                    });
-                }
-            });
+                _pending.Remove(hwnd);
+                _policy.Forget(hwnd);
+                if (_tracker.IsTracked(hwnd)) _manager.HandleWindowDestroyed(hwnd);
+                return;
+            }
+            if (shiftHeld && !_tracker.IsTracked(hwnd)) _policy.Bypass(hwnd);
+            _pending.Add(hwnd);
+        });
+    }
+
+    private void ReconcilePending()
+    {
+        var windows = _pending.ToArray();
+        _pending.Clear();
+        foreach (var hwnd in windows)
+        {
+            if (!NativeMethods.IsWindow(hwnd)) { _policy.Forget(hwnd); continue; }
+            var placement = NativeMethods.WINDOWPLACEMENT.Default;
+            if (!NativeMethods.GetWindowPlacement(hwnd, ref placement)) continue;
+            bool tracked = _tracker.IsTracked(hwnd);
+            var action = _policy.Decide(hwnd, new(
+                placement.showCmd == NativeMethods.SW_MAXIMIZE, tracked,
+                _manager.IsBusy(hwnd), !tracked && _eligible(hwnd) && _manager.CanAutomaticallyManage(hwnd)),
+                _settings.AutoManageMaximizedWindows);
+            if (action == AutomaticWindowAction.Enter) _manager.MaximizeToDesktop(hwnd);
+            else if (action == AutomaticWindowAction.Restore) _manager.Restore(hwnd, preserveWindowState: true);
         }
     }
 
-    private async void OnMoveSizeEnd(IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
-        int idObject, int idChild, uint idEventThread, uint dwmsEventTime)
+    private void Post(Action action)
     {
-        // Only care about top-level window changes (OBJID_WINDOW)
-        if (idObject != NativeMethods.OBJID_WINDOW || idChild != 0) return;
-
-        // If this window was pending maximize, handle it now
-        bool wasPending = false;
-        if (!_syncControl.IsDisposed && _syncControl.IsHandleCreated)
-        {
-            wasPending = (bool)_syncControl.Invoke(new Func<bool>(() => _pendingMaximize.Remove(hwnd)));
-        }
-        if (wasPending)
-        {
-            Trace.WriteLine($"WindowMonitor: MoveSizeEnd triggered for pending maximize window {hwnd}.");
-            MarshalToUiThread(() => _manager.MaximizeToDesktop(hwnd));
-            return;
-        }
-
-        // Handle only tracked windows that are being restored (not maximized)
-        if (!_tracker.IsTracked(hwnd)) return;
-        var placement = NativeMethods.WINDOWPLACEMENT.Default;
-        if (!NativeMethods.GetWindowPlacement(hwnd, ref placement)) return;
-        Trace.WriteLine($"WindowMonitor: MoveSizeEnd: tracked window {hwnd} showCmd={placement.showCmd}.");
-        if (placement.showCmd != NativeMethods.SW_MAXIMIZE)
-        {
-            Trace.WriteLine($"WindowMonitor: Tracked window {hwnd} un-maximized via move/size, restoring.");
-            await Task.Delay(100);
-            MarshalToUiThread(() => _manager.Restore(hwnd));
-        }
-    }
-
-    private void OnDestroy(IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
-        int idObject, int idChild, uint idEventThread, uint dwmsEventTime)
-    {
-        if (idObject != NativeMethods.OBJID_WINDOW || idChild != 0) return;
-        if (!_tracker.IsTracked(hwnd)) return;
-
-        Trace.WriteLine($"WindowMonitor: Tracked window {hwnd} destroyed.");
-        MarshalToUiThread(() => _manager.HandleWindowDestroyed(hwnd));
-    }
-
-    private void MarshalToUiThread(Action action)
-    {
-        if (_syncControl.IsDisposed || !_syncControl.IsHandleCreated) return;
-
-        try
-        {
-            _syncControl.BeginInvoke(action);
-        }
-        catch (ObjectDisposedException)
-        {
-            // App is shutting down
-        }
+        if (_disposed || _syncControl.IsDisposed || !_syncControl.IsHandleCreated) return;
+        try { _syncControl.BeginInvoke(() => { if (!_disposed) action(); }); }
+        catch (InvalidOperationException) { }
     }
 
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
-
-        if (_locationChangeHook != IntPtr.Zero)
-        {
-            NativeMethods.UnhookWinEvent(_locationChangeHook);
-            _locationChangeHook = IntPtr.Zero;
-        }
-        if (_destroyHook != IntPtr.Zero)
-        {
-            NativeMethods.UnhookWinEvent(_destroyHook);
-            _destroyHook = IntPtr.Zero;
-        }
-        if (_moveSizeEndHook != IntPtr.Zero)
-        {
-            NativeMethods.UnhookWinEvent(_moveSizeEndHook);
-            _moveSizeEndHook = IntPtr.Zero;
-        }
-
-        Trace.WriteLine("WindowMonitor: Disposed.");
+        _timer.Stop();
+        _timer.Dispose();
+        foreach (var hook in _hooks) NativeMethods.UnhookWinEvent(hook);
+        _hooks.Clear();
+        _pending.Clear();
+        _policy.Clear();
     }
 }
