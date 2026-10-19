@@ -73,13 +73,13 @@ internal sealed class TrayApplication : Form
         var buildNumber = GetWindowsBuildNumber();
         Trace.WriteLine($"TrayApplication: Windows build {buildNumber}");
 
-        if (buildNumber < 22000)
+        if (buildNumber < 19045)
         {
             // Not Windows 11 at all
             MessageBox.Show(
-                "MaximizeToVirtualDesktop requires Windows 11.\n\n" +
+                "MaximizeToVirtualDesktop requires Windows 10 22H2 or Windows 11.\n\n" +
                 $"Your system is running Windows build {buildNumber}.\n" +
-                "Virtual Desktop APIs needed by this app are not available on Windows 10.",
+                "This Windows build is outside the supported desktop interface range.",
                 "MaximizeToVirtualDesktop — Unsupported Windows Version",
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
             Application.Exit();
@@ -581,7 +581,7 @@ internal sealed class TrayApplication : Form
             {
                 Trace.WriteLine($"TrayApplication: Removing orphaned desktop {entry.TempDesktopId} ({entry.ProcessName ?? "unknown"})");
                 _vds.RemoveDesktop(desktop);
-                Marshal.ReleaseComObject(desktop);
+                ComRelease.Release(desktop);
             }
         }
 

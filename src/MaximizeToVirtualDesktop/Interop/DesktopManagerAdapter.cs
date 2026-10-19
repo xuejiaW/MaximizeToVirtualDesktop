@@ -26,6 +26,13 @@ internal abstract class DesktopManagerAdapter : IDisposable
     /// </summary>
     public static DesktopManagerAdapter Create(object comObject, int buildNumber)
     {
+        if (buildNumber < 22000)
+        {
+            var windows10 = new AdapterWindows10((IVirtualDesktopManagerInternal10)comObject);
+            if (windows10.SmokeTest()) return windows10;
+            windows10.Dispose();
+            throw new InvalidOperationException("Windows 10 virtual desktop interface validation failed.");
+        }
         // Try build-appropriate adapter first
         var primary = buildNumber >= 26100
             ? TryCreate24H2(comObject)
@@ -90,12 +97,35 @@ internal abstract class DesktopManagerAdapter : IDisposable
         }
         finally
         {
-            if (found != null) Marshal.ReleaseComObject(found);
-            if (current != null) Marshal.ReleaseComObject(current);
+            if (found != null) ComRelease.Release(found);
+            if (current != null) ComRelease.Release(current);
         }
     }
 
     // --- 24H2 adapter (build 26100+) ---
+
+    private sealed class AdapterWindows10(IVirtualDesktopManagerInternal10 com) : DesktopManagerAdapter
+    {
+        public override int GetCount() => com.GetCount();
+        public override IVirtualDesktop GetCurrentDesktop() => new Windows10Desktop(com.GetCurrentDesktop());
+        public override IVirtualDesktop CreateDesktop() => new Windows10Desktop(com.CreateDesktop());
+        private static IVirtualDesktop10 Native(IVirtualDesktop desktop) => ((Windows10Desktop)desktop).Native;
+        public override void MoveViewToDesktop(IApplicationView view, IVirtualDesktop desktop)
+            => com.MoveViewToDesktop(view, Native(desktop));
+        public override int GetAdjacentDesktop(IVirtualDesktop from, int direction, out IVirtualDesktop desktop)
+        {
+            int hr = com.GetAdjacentDesktop(Native(from), direction, out var adjacent);
+            desktop = hr == 0 ? new Windows10Desktop(adjacent) : null!;
+            return hr;
+        }
+        public override void SwitchDesktopWithAnimation(IVirtualDesktop desktop) => com.SwitchDesktop(Native(desktop));
+        public override void RemoveDesktop(IVirtualDesktop desktop, IVirtualDesktop fallback)
+            => com.RemoveDesktop(Native(desktop), Native(fallback));
+        public override IVirtualDesktop FindDesktop(ref Guid desktopId) => new Windows10Desktop(com.FindDesktop(ref desktopId));
+        // Naming is optional; desktop identity and recovery do not depend on it.
+        public override void SetDesktopName(IVirtualDesktop desktop, IntPtr nameHString) { }
+        public override void Dispose() => ComRelease.Release(com);
+    }
 
     private sealed class Adapter24H2 : DesktopManagerAdapter
     {
@@ -120,7 +150,7 @@ internal abstract class DesktopManagerAdapter : IDisposable
 
         public override void Dispose()
         {
-            if (_com != null) { Marshal.ReleaseComObject(_com); _com = null; }
+            if (_com != null) { ComRelease.Release(_com); _com = null; }
         }
     }
 
@@ -149,7 +179,7 @@ internal abstract class DesktopManagerAdapter : IDisposable
 
         public override void Dispose()
         {
-            if (_com != null) { Marshal.ReleaseComObject(_com); _com = null; }
+            if (_com != null) { ComRelease.Release(_com); _com = null; }
         }
     }
 }

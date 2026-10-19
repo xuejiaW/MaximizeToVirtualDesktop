@@ -145,10 +145,10 @@ internal sealed class FullScreenManager
                 }
                 finally
                 {
-                    if (origDesktop != null) Marshal.ReleaseComObject(origDesktop);
+                    if (origDesktop != null) ComRelease.Release(origDesktop);
                 }
                 _vds.RemoveDesktop(tempDesktop);
-                Marshal.ReleaseComObject(tempDesktop);
+                ComRelease.Release(tempDesktop);
                 return;
             }
             else
@@ -176,10 +176,10 @@ internal sealed class FullScreenManager
             }
             finally
             {
-                if (origDesktop != null) Marshal.ReleaseComObject(origDesktop);
+                if (origDesktop != null) ComRelease.Release(origDesktop);
             }
             _vds.RemoveDesktop(tempDesktop);
-            Marshal.ReleaseComObject(tempDesktop);
+            ComRelease.Release(tempDesktop);
             return;
         }
 
@@ -258,14 +258,14 @@ internal sealed class FullScreenManager
         }
         finally
         {
-            if (origDesktop != null) Marshal.ReleaseComObject(origDesktop);
+            if (origDesktop != null) ComRelease.Release(origDesktop);
         }
 
         // Remove temp desktop and release its COM reference
         if (_releasedDesktops.Add(entry.TempDesktopId))
         {
             _vds.RemoveDesktop(entry.TempDesktop);
-            Marshal.ReleaseComObject(entry.TempDesktop);
+            ComRelease.Release(entry.TempDesktop);
         }
       
         _tracker.Untrack(hwnd);
@@ -303,14 +303,14 @@ internal sealed class FullScreenManager
         }
         finally
         {
-            if (origDesktop != null) Marshal.ReleaseComObject(origDesktop);
+            if (origDesktop != null) ComRelease.Release(origDesktop);
         }
 
         // Remove the temp desktop and release its COM reference
         if (_releasedDesktops.Add(entry.TempDesktopId))
         {
             _vds.RemoveDesktop(entry.TempDesktop);
-            Marshal.ReleaseComObject(entry.TempDesktop);
+            ComRelease.Release(entry.TempDesktop);
         }
     }
 

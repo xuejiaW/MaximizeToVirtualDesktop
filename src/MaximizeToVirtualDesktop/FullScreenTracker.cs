@@ -73,7 +73,7 @@ internal sealed class FullScreenTracker
         {
             foreach (var entry in _entries.Values)
             {
-                try { Marshal.ReleaseComObject(entry.TempDesktop); } catch { }
+                try { ComRelease.Release(entry.TempDesktop); } catch { }
             }
             var count = _entries.Count;
             _entries.Clear();

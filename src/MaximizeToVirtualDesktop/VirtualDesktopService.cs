@@ -28,7 +28,9 @@ internal sealed class VirtualDesktopService : IDisposable
             shell = (IServiceProvider10)Activator.CreateInstance(
                 Type.GetTypeFromCLSID(ComGuids.CLSID_ImmersiveShell)!)!;
 
-            var mgrInternalGuid = ComGuids.IID_VirtualDesktopManagerInternal;
+            var mgrInternalGuid = windowsBuildNumber < 22000
+                ? typeof(IVirtualDesktopManagerInternal10).GUID
+                : ComGuids.IID_VirtualDesktopManagerInternal;
             var mgrInternalRaw = shell.QueryService(
                 ref Unsafe.AsRef(ComGuids.CLSID_VirtualDesktopManagerInternal), ref mgrInternalGuid);
 
@@ -64,7 +66,7 @@ internal sealed class VirtualDesktopService : IDisposable
         }
         finally
         {
-            if (shell != null) Marshal.ReleaseComObject(shell);
+            if (shell != null) ComRelease.Release(shell);
         }
     }
 
@@ -92,7 +94,31 @@ internal sealed class VirtualDesktopService : IDisposable
         }
         finally
         {
-            if (desktop != null) Marshal.ReleaseComObject(desktop);
+            if (desktop != null) ComRelease.Release(desktop);
+        }
+    }
+
+    public int GetDesktopCount() => _managerInternal?.GetCount() ?? 0;
+
+    public bool SwitchAdjacentDesktop(bool right)
+    {
+        IVirtualDesktop? current = null;
+        IVirtualDesktop? adjacent = null;
+        try
+        {
+            current = _managerInternal!.GetCurrentDesktop();
+            if (_managerInternal.GetAdjacentDesktop(current, right ? 4 : 3, out adjacent) != 0) return false;
+            return SwitchToDesktop(adjacent);
+        }
+        catch (Exception ex)
+        {
+            Trace.WriteLine($"VirtualDesktopService: Adjacent switch failed: {ex.Message}");
+            return false;
+        }
+        finally
+        {
+            if (adjacent != null) ComRelease.Release(adjacent);
+            if (current != null) ComRelease.Release(current);
         }
     }
 
@@ -157,7 +183,7 @@ internal sealed class VirtualDesktopService : IDisposable
         catch (Exception ex)
         {
             Trace.WriteLine($"VirtualDesktopService: MoveWindowToDesktop failed for hwnd={hwnd}: {ex.GetType().Name}: {ex.Message}");
-            if (view != null) { Marshal.ReleaseComObject(view); view = null; }
+            if (view != null) { ComRelease.Release(view); view = null; }
 
             // Second attempt: try main window of the process
             IApplicationView? fallbackView = null;
@@ -182,14 +208,14 @@ internal sealed class VirtualDesktopService : IDisposable
             }
             finally
             {
-                if (fallbackView != null) Marshal.ReleaseComObject(fallbackView);
+                if (fallbackView != null) ComRelease.Release(fallbackView);
             }
 
             return false;
         }
         finally
         {
-            if (view != null) Marshal.ReleaseComObject(view);
+            if (view != null) ComRelease.Release(view);
         }
     }
 
@@ -273,8 +299,8 @@ internal sealed class VirtualDesktopService : IDisposable
         }
         finally
         {
-            if (adjacent != null) Marshal.ReleaseComObject(adjacent);
-            if (current != null) Marshal.ReleaseComObject(current);
+            if (adjacent != null) ComRelease.Release(adjacent);
+            if (current != null) ComRelease.Release(current);
         }
     }
 
@@ -332,7 +358,7 @@ internal sealed class VirtualDesktopService : IDisposable
         }
         finally
         {
-            if (view != null) Marshal.ReleaseComObject(view);
+            if (view != null) ComRelease.Release(view);
         }
     }
 
@@ -358,7 +384,7 @@ internal sealed class VirtualDesktopService : IDisposable
         }
         finally
         {
-            if (view != null) Marshal.ReleaseComObject(view);
+            if (view != null) ComRelease.Release(view);
         }
     }
 
@@ -384,16 +410,16 @@ internal sealed class VirtualDesktopService : IDisposable
         }
         finally
         {
-            if (view != null) Marshal.ReleaseComObject(view);
+            if (view != null) ComRelease.Release(view);
         }
     }
 
     private void ReleaseComObjects()
     {
         if (_managerInternal != null) { _managerInternal.Dispose(); _managerInternal = null; }
-        if (_manager != null) { Marshal.ReleaseComObject(_manager); _manager = null; }
-        if (_viewCollection != null) { Marshal.ReleaseComObject(_viewCollection); _viewCollection = null; }
-        if (_pinnedApps != null) { Marshal.ReleaseComObject(_pinnedApps); _pinnedApps = null; }
+        if (_manager != null) { ComRelease.Release(_manager); _manager = null; }
+        if (_viewCollection != null) { ComRelease.Release(_viewCollection); _viewCollection = null; }
+        if (_pinnedApps != null) { ComRelease.Release(_pinnedApps); _pinnedApps = null; }
     }
 
     public void Dispose()
